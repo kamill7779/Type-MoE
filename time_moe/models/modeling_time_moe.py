@@ -13,6 +13,7 @@ from transformers.utils import logging, is_flash_attn_2_available, is_flash_attn
 
 from .configuration_time_moe import TimeMoeConfig
 from .ts_generation_mixin import TSGenerationMixin
+from .experts.registry import build_expert
 
 logger = logging.get_logger(__name__)
 
@@ -378,13 +379,29 @@ class TimeMoeSparseExpertsLayer(nn.Module):
 
         # gating
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [TimeMoeTemporalBlock(
-                hidden_size=self.config.hidden_size,
-                intermediate_size=moe_intermediate_size,
-                hidden_act=self.config.hidden_act,
-            ) for _ in range(self.num_experts)]
-        )
+        custom_expert_specs = getattr(config, "custom_expert_specs", [])
+        if isinstance(custom_expert_specs, list) and len(custom_expert_specs) > 0:
+            if len(custom_expert_specs) != self.num_experts:
+                raise ValueError(
+                    f"custom_expert_specs size mismatch: expected {self.num_experts}, got {len(custom_expert_specs)}"
+                )
+            self.experts = nn.ModuleList(
+                [build_expert(
+                    spec=spec,
+                    hidden_size=self.config.hidden_size,
+                    intermediate_size=moe_intermediate_size,
+                    hidden_act=self.config.hidden_act,
+                    output_norm=bool(getattr(config, "expert_output_norm", True)),
+                ) for spec in custom_expert_specs]
+            )
+        else:
+            self.experts = nn.ModuleList(
+                [TimeMoeTemporalBlock(
+                    hidden_size=self.config.hidden_size,
+                    intermediate_size=moe_intermediate_size,
+                    hidden_act=self.config.hidden_act,
+                ) for _ in range(self.num_experts)]
+            )
 
         self.shared_expert = TimeMoeTemporalBlock(
             hidden_size=self.config.hidden_size,
