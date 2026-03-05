@@ -98,6 +98,12 @@ if __name__ == "__main__":
         "--from_scratch", action="store_true", help="train from scratch"
     )
     parser.add_argument(
+        "--model_config_override",
+        type=str,
+        default=None,
+        help="Path to YAML/JSON file used to override TimeMoeConfig fields",
+    )
+    parser.add_argument(
         "--save_steps", type=int, default=None, help="number of steps to save model"
     )
     parser.add_argument(
@@ -187,4 +193,5 @@ if __name__ == "__main__":
         dataloader_num_workers=args.dataloader_num_workers,
         save_only_model=args.save_only_model,
         save_total_limit=args.save_total_limit,
+        model_config_override=args.model_config_override,
     )

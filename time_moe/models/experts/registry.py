@@ -18,6 +18,14 @@ class RegisteredMLPTemporalBlockExpert(MLPTemporalBlockExpert):
     pass
 
 
+def _ensure_extended_experts_registered():
+    # Lazy import to avoid circular initialization.
+    from . import nbeats_token_expert  # noqa: F401
+    from . import autoformer_token_expert  # noqa: F401
+    from . import fedformer_token_expert  # noqa: F401
+    from . import anomaly_token_expert  # noqa: F401
+
+
 def _normalize_spec(spec: Any) -> Dict[str, Any]:
     if isinstance(spec, str):
         return {"name": spec, "params": {}}
@@ -43,6 +51,7 @@ def build_expert(
         hidden_act: str,
         output_norm: bool = True,
 ):
+    _ensure_extended_experts_registered()
     normalized = _normalize_spec(spec)
     name = normalized["name"]
     if name not in EXPERT_REGISTRY:

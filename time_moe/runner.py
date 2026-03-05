@@ -1,10 +1,12 @@
 import os
 import math
 import random
+import json
 from functools import reduce
 from operator import mul
 
 import torch
+import yaml
 
 from time_moe.datasets.time_moe_dataset import TimeMoEDataset
 from time_moe.datasets.time_moe_window_dataset import TimeMoEWindowDataset
@@ -29,6 +31,8 @@ class TimeMoeRunner:
         if model_path is None:
             model_path = self.model_path
         attn = kwargs.pop('attn_implementation', None)
+        model_config_override = kwargs.pop('model_config_override', None)
+        config_overrides = _load_model_config_override(model_config_override)
         if attn is None:
             attn = 'eager'
         elif attn == 'auto':
@@ -51,9 +55,20 @@ class TimeMoeRunner:
 
         if from_scatch:
             config = TimeMoeConfig.from_pretrained(model_path, _attn_implementation=attn)
+            _apply_config_overrides(config, config_overrides)
             model = TimeMoeForPrediction(config)
         else:
-            model = TimeMoeForPrediction.from_pretrained(model_path, **kwargs)
+            if config_overrides:
+                config = TimeMoeConfig.from_pretrained(model_path, _attn_implementation=attn)
+                _apply_config_overrides(config, config_overrides)
+                model = TimeMoeForPrediction.from_pretrained(
+                    model_path,
+                    config=config,
+                    ignore_mismatched_sizes=True,
+                    **kwargs
+                )
+            else:
+                model = TimeMoeForPrediction.from_pretrained(model_path, **kwargs)
         return model
 
     def train_model(self, from_scratch: bool = False, **kwargs):
@@ -163,6 +178,7 @@ class TimeMoeRunner:
                 from_scatch=from_scratch,
                 torch_dtype=torch_dtype,
                 attn_implementation=train_config.get('attn_implementation', 'eager'),
+                model_config_override=train_config.get('model_config_override'),
             )
             log_in_local_rank_0(f'Load model parameters from: {model_path}')
         else:
@@ -248,3 +264,30 @@ def _safe_float(number):
         return None
     else:
         return float(number)
+
+
+def _load_model_config_override(path: str):
+    if path is None:
+        return None
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"model config override file not found: {path}")
+    suffix = os.path.splitext(path)[-1].lower()
+    with open(path, 'r', encoding='utf-8') as f:
+        if suffix in ['.yaml', '.yml']:
+            data = yaml.safe_load(f)
+        elif suffix == '.json':
+            data = json.load(f)
+        else:
+            raise ValueError(f"Unsupported config override file type: {suffix}")
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError("model config override file must decode to a dictionary")
+    return data
+
+
+def _apply_config_overrides(config: TimeMoeConfig, overrides: dict):
+    if not overrides:
+        return
+    for key, value in overrides.items():
+        setattr(config, key, value)

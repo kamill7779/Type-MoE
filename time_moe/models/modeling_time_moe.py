@@ -411,6 +411,18 @@ class TimeMoeSparseExpertsLayer(nn.Module):
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
         expert_type_map = getattr(config, "expert_type_map", [])
+        if (not isinstance(expert_type_map, list) or len(expert_type_map) != self.num_experts) and \
+                isinstance(custom_expert_specs, list) and len(custom_expert_specs) == self.num_experts:
+            expert_types = list(getattr(config, "expert_types", []) or [])
+            if len(expert_types) > 0:
+                type_to_id = {name: idx for idx, name in enumerate(expert_types)}
+                inferred_map = []
+                for spec in custom_expert_specs:
+                    spec_type = spec.get("type") if isinstance(spec, dict) else None
+                    inferred_map.append(type_to_id.get(spec_type, -1))
+                if min(inferred_map) >= 0:
+                    expert_type_map = inferred_map
+
         if isinstance(expert_type_map, list) and len(expert_type_map) == self.num_experts:
             self.register_buffer("expert_type_ids", torch.tensor(expert_type_map, dtype=torch.long), persistent=False)
         else:
