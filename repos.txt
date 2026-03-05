@@ -1,0 +1,4 @@
+https://github.com/thuml/Anomaly-Transformer.git
+https://github.com/MAZiqing/FEDformer.git
+https://github.com/thuml/Autoformer.git
+https://github.com/ServiceNow/N-BEATS.git
