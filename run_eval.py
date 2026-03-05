@@ -3,6 +3,7 @@
 import json
 import os
 import argparse
+import collections
 import numpy as np
 import logging
 import torch
@@ -92,6 +93,63 @@ class TimeMoE:
         return preds, labels
 
 
+def _collect_routing_stats_from_model(internal_model, routing_stats):
+    """Collect per-layer routing statistics from _last_routing in each MoE layer."""
+    try:
+        layers = internal_model.model.layers
+    except AttributeError:
+        return
+    for layer_idx, layer in enumerate(layers):
+        ffn = getattr(layer, 'ffn_layer', None)
+        if ffn is None:
+            continue
+        last_routing = getattr(ffn, '_last_routing', None)
+        if not last_routing:
+            continue
+        selected = last_routing.get('selected_experts')
+        if selected is None:
+            continue
+        # Count per-expert selections
+        for expert_idx in selected.reshape(-1).tolist():
+            routing_stats[layer_idx][expert_idx] = routing_stats[layer_idx].get(expert_idx, 0) + 1
+
+
+def _format_routing_stats(routing_stats, model_wrapper):
+    """Format routing stats into a JSON-serialisable dict."""
+    try:
+        config = model_wrapper.model.config
+        expert_type_map = getattr(config, 'expert_type_map', [])
+        expert_types = getattr(config, 'expert_types', [])
+        num_experts = getattr(config, 'num_experts', 0)
+    except AttributeError:
+        expert_type_map = []
+        expert_types = []
+        num_experts = 0
+
+    output = {
+        'num_experts': num_experts,
+        'expert_types': expert_types,
+        'expert_type_map': expert_type_map,
+        'per_layer': {},
+    }
+    for layer_idx in sorted(routing_stats.keys()):
+        layer_data = routing_stats[layer_idx]
+        total = sum(layer_data.values())
+        expert_stats = {}
+        for eidx in range(num_experts):
+            count = layer_data.get(eidx, 0)
+            expert_stats[str(eidx)] = {
+                'count': count,
+                'fraction': count / max(total, 1),
+                'type': expert_types[expert_type_map[eidx]] if eidx < len(expert_type_map) and expert_type_map[eidx] < len(expert_types) else 'unknown',
+            }
+        output['per_layer'][str(layer_idx)] = {
+            'total_selections': total,
+            'experts': expert_stats,
+        }
+    return output
+
+
 def evaluate(args):
     batch_size = args.batch_size
     context_length = args.context_length
@@ -155,6 +213,9 @@ def evaluate(args):
     )
 
     acc_count = 0
+    routing_stats = collections.defaultdict(lambda: collections.defaultdict(float))
+    export_routing = getattr(args, 'export_routing_stats', False)
+
     with torch.no_grad():
         for idx, batch in enumerate(tqdm(test_dl)):
             preds, labels = model.predict(batch)
@@ -163,6 +224,10 @@ def evaluate(args):
                 metric.push(preds, labels)
 
             acc_count += count_num_tensor_elements(preds)
+
+            # Collect routing stats if requested
+            if export_routing:
+                _collect_routing_stats_from_model(model.model, routing_stats)
 
     ret_metric = {}
     for metric in metric_list:
@@ -192,6 +257,16 @@ def evaluate(args):
             item[metric.name] = float(val.cpu().numpy())
         logging.info(item)
 
+    # Export routing stats
+    if export_routing and rank == 0:
+        routing_output = _format_routing_stats(routing_stats, model.model)
+        out_path = getattr(args, 'routing_stats_path', None) or os.path.join(
+            os.path.dirname(args.model) if os.path.isdir(args.model) else '.', 'routing_stats.json'
+        )
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(routing_output, f, indent=2, default=str)
+        logging.info(f'Routing stats saved to {out_path}')
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('TimeMoE Evaluate')
@@ -216,7 +291,20 @@ if __name__ == '__main__':
     parser.add_argument(
         '--context_length', '-c',
         type=int,
+        default=None,
         help='Context length'
+    )
+    parser.add_argument(
+        '--export_routing_stats',
+        action='store_true',
+        default=False,
+        help='Export typed routing statistics to JSON after evaluation'
+    )
+    parser.add_argument(
+        '--routing_stats_path',
+        type=str,
+        default=None,
+        help='Output path for routing stats JSON (default: routing_stats.json next to model)'
     )
     parser.add_argument(
         '--prediction_length', '-p',

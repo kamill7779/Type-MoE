@@ -14,6 +14,14 @@ from transformers.utils import logging, is_flash_attn_2_available, is_flash_attn
 from .configuration_time_moe import TimeMoeConfig
 from .ts_generation_mixin import TSGenerationMixin
 from .experts.registry import build_expert
+from .typed_router_utils import (
+    RouterInfo,
+    typed_preselect,
+    _resolve_actual_k,
+    _collect_routing_stats,
+    load_balancing_loss_func,
+    type_diversity_loss_func,
+)
 
 logger = logging.get_logger(__name__)
 
@@ -39,185 +47,11 @@ def _get_unpad_data(attention_mask):
     )
 
 
-def typed_preselect(
-        routing_weights: torch.Tensor,
-        expert_type_ids: Optional[torch.Tensor],
-) -> torch.Tensor:
-    """
-    Keep only one winner expert per type for each token.
-    """
-    if expert_type_ids is None:
-        return routing_weights
-    if expert_type_ids.numel() != routing_weights.shape[-1]:
-        raise ValueError(
-            f"expert_type_ids size mismatch: expected {routing_weights.shape[-1]}, got {expert_type_ids.numel()}"
-        )
-
-    filtered = torch.zeros_like(routing_weights)
-    num_types = int(expert_type_ids.max().item()) + 1
-    token_indices = torch.arange(routing_weights.size(0), device=routing_weights.device)
-    for type_id in range(num_types):
-        type_mask = (expert_type_ids == type_id)
-        if not torch.any(type_mask):
-            continue
-        type_probs = routing_weights[:, type_mask]
-        best_local = type_probs.argmax(dim=-1)
-        global_indices = type_mask.nonzero(as_tuple=True)[0]
-        best_global = global_indices[best_local]
-        filtered[token_indices, best_global] = routing_weights[token_indices, best_global]
-    return filtered
+# typed_preselect, _resolve_actual_k, _collect_routing_stats, load_balancing_loss_func,
+# type_diversity_loss_func are now in typed_router_utils.py
 
 
-def _resolve_actual_k(filtered_weights: torch.Tensor, requested_top_k: int) -> int:
-    valid_counts = (filtered_weights > 0).sum(dim=-1)
-    if valid_counts.numel() == 0:
-        return 1
-    min_valid = int(valid_counts.min().item())
-    if min_valid <= 0:
-        return 1
-    return max(1, min(int(requested_top_k), min_valid))
-
-
-def _collect_routing_stats(
-        filtered_weights: torch.Tensor,
-        selected_experts: torch.Tensor,
-        num_experts: int,
-        token_mask: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts).float()
-    if token_mask is None:
-        tokens_per_expert = expert_mask.sum(dim=(0, 1)) / float(expert_mask.shape[0] * expert_mask.shape[1])
-        router_prob_per_expert = torch.mean(filtered_weights, dim=0)
-        return tokens_per_expert, router_prob_per_expert
-
-    token_mask = token_mask.to(filtered_weights.device).float()
-    expanded_mask = token_mask[:, None, None]
-    denom_assign = (expanded_mask.sum() * selected_experts.shape[1]).clamp(min=1.0)
-    tokens_per_expert = (expert_mask * expanded_mask).sum(dim=(0, 1)) / denom_assign
-
-    denom_prob = token_mask.sum().clamp(min=1.0)
-    router_prob_per_expert = (filtered_weights * token_mask[:, None]).sum(dim=0) / denom_prob
-    return tokens_per_expert, router_prob_per_expert
-
-
-def load_balancing_loss_func(
-        gate_logits: Union[torch.Tensor, Tuple[torch.Tensor], List[torch.Tensor]],
-        top_k: int,
-        num_experts: int = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        router_mode: str = "standard",
-        expert_type_map: Optional[List[int]] = None,
-) -> torch.Tensor:
-    r"""
-    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
-
-    See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
-    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
-    experts is too unbalanced.
-
-    Args:
-        gate_logits (Union[`torch.Tensor`, Tuple[torch.Tensor], List[torch.Tensor]):
-            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
-            shape [batch_size X sequence_length, num_experts].
-        top_k (`int`)
-            Selected Top k over the experts.
-        attention_mask (`torch.Tensor`, None):
-            The attention_mask used in forward function
-            shape [batch_size X sequence_length] if not None.
-        num_experts (`int`, *optional*):
-            Number of experts
-
-    Returns:
-        The auxiliary loss.
-    """
-    if gate_logits is None or not isinstance(gate_logits, (tuple, list)) or gate_logits[0] is None:
-        return torch.tensor(0.0)
-
-    compute_device = gate_logits[0].device
-    if num_experts is None:
-        num_experts = gate_logits[0].shape[-1]
-
-    typed_mode = router_mode == "typed_topk" and expert_type_map is not None and len(expert_type_map) == num_experts
-    if typed_mode:
-        expert_type_ids = torch.tensor(expert_type_map, dtype=torch.long, device=compute_device)
-    else:
-        expert_type_ids = None
-
-    token_mask = None
-    if attention_mask is not None:
-        token_mask = attention_mask.reshape(-1).to(compute_device).float()
-
-    layer_losses = []
-    for layer_gate in gate_logits:
-        layer_logits = layer_gate.to(compute_device)
-        routing_weights = torch.nn.functional.softmax(layer_logits, dim=-1)
-        filtered_weights = typed_preselect(routing_weights, expert_type_ids) if typed_mode else routing_weights
-
-        layer_k = _resolve_actual_k(filtered_weights, top_k)
-        _, selected_experts = torch.topk(filtered_weights, layer_k, dim=-1)
-
-        layer_mask = token_mask
-        if layer_mask is not None and layer_mask.numel() != filtered_weights.shape[0]:
-            layer_mask = None
-        tokens_per_expert, router_prob_per_expert = _collect_routing_stats(
-            filtered_weights=filtered_weights,
-            selected_experts=selected_experts,
-            num_experts=num_experts,
-            token_mask=layer_mask,
-        )
-        layer_loss = torch.sum(tokens_per_expert * router_prob_per_expert)
-        layer_losses.append(layer_loss * num_experts)
-
-    if len(layer_losses) == 0:
-        return torch.tensor(0.0, device=compute_device)
-    return torch.stack(layer_losses).mean()
-
-
-def type_diversity_loss_func(
-        gate_logits: Union[torch.Tensor, Tuple[torch.Tensor], List[torch.Tensor]],
-        top_k: int,
-        expert_type_map: Optional[List[int]],
-        attention_mask: Optional[torch.Tensor] = None,
-        router_mode: str = "standard",
-) -> torch.Tensor:
-    if gate_logits is None or not isinstance(gate_logits, (tuple, list)) or gate_logits[0] is None:
-        return torch.tensor(0.0)
-    if top_k <= 1 or router_mode != "typed_topk":
-        return torch.tensor(0.0, device=gate_logits[0].device)
-
-    num_experts = gate_logits[0].shape[-1]
-    if expert_type_map is None or len(expert_type_map) != num_experts:
-        return torch.tensor(0.0, device=gate_logits[0].device)
-
-    compute_device = gate_logits[0].device
-    expert_type_ids = torch.tensor(expert_type_map, dtype=torch.long, device=compute_device)
-    num_types = int(expert_type_ids.max().item()) + 1
-
-    token_mask = None
-    if attention_mask is not None:
-        token_mask = attention_mask.reshape(-1).to(compute_device).bool()
-
-    losses = []
-    for layer_gate in gate_logits:
-        routing_weights = torch.nn.functional.softmax(layer_gate.to(compute_device), dim=-1)
-        filtered_weights = typed_preselect(routing_weights, expert_type_ids)
-        layer_k = _resolve_actual_k(filtered_weights, top_k)
-        _, selected_experts = torch.topk(filtered_weights, layer_k, dim=-1)
-
-        if token_mask is not None and token_mask.numel() == selected_experts.shape[0]:
-            selected_experts = selected_experts[token_mask]
-        if selected_experts.numel() == 0:
-            continue
-
-        selected_types = expert_type_ids[selected_experts]
-        type_one_hot = F.one_hot(selected_types, num_classes=num_types).float()
-        unique_per_token = (type_one_hot.sum(dim=1) > 0).sum(dim=-1).float()
-        target_unique = float(min(layer_k, num_types))
-        losses.append((target_unique - unique_per_token).clamp(min=0).mean())
-
-    if len(losses) == 0:
-        return torch.tensor(0.0, device=compute_device)
-    return torch.stack(losses).mean()
+# load_balancing_loss_func and type_diversity_loss_func are now in typed_router_utils.py
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -439,11 +273,11 @@ class TimeMoeSparseExpertsLayer(nn.Module):
         if self.training and self.jitter_noise > 0:
             router_logits = router_logits + torch.randn_like(router_logits) * self.jitter_noise
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        raw_routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         if self.router_mode == "typed_topk":
-            filtered_weights = typed_preselect(routing_weights, self.expert_type_ids)
+            filtered_weights = typed_preselect(raw_routing_weights, self.expert_type_ids)
         else:
-            filtered_weights = routing_weights
+            filtered_weights = raw_routing_weights
 
         actual_k = _resolve_actual_k(filtered_weights, self.top_k)
         self.actual_k = actual_k
@@ -463,6 +297,10 @@ class TimeMoeSparseExpertsLayer(nn.Module):
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
         seq_expert_cache = {}
 
+        # KV-cache inference: when sequence_length == 1, seq experts cannot run
+        # FFT / moving-average meaningfully.  Fall back to flat interface.
+        _use_seq_fallback = (sequence_length == 1)
+
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
@@ -474,12 +312,17 @@ class TimeMoeSparseExpertsLayer(nn.Module):
             # the current expert. We need to make sure to multiply the output hidden
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
             interface_kind = getattr(expert_layer, "interface_kind", "flat")
-            if interface_kind == "seq":
+            if interface_kind == "seq" and not _use_seq_fallback:
+                # S1: full-sequence execution + selective aggregation
                 if expert_idx not in seq_expert_cache:
                     seq_out = expert_layer(hidden_states_3d)
                     seq_expert_cache[expert_idx] = seq_out.reshape(-1, hidden_dim)
                 current_state = seq_expert_cache[expert_idx][top_x]
                 current_hidden_states = current_state * routing_weights[top_x, idx, None]
+            elif interface_kind == "seq" and _use_seq_fallback:
+                # KV-cache single-token fallback: use flat fallback projection
+                current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+                current_hidden_states = expert_layer.forward_flat_fallback(current_state) * routing_weights[top_x, idx, None]
             else:
                 current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
                 current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
@@ -494,14 +337,25 @@ class TimeMoeSparseExpertsLayer(nn.Module):
         final_hidden_states = final_hidden_states + shared_expert_output
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+
+        # Build RouterInfo for downstream loss functions (avoids re-computing route)
+        router_info = RouterInfo(
+            raw_logits=router_logits,
+            topk_indices=selected_experts,
+            topk_weights=routing_weights,
+            filtered_probs=filtered_weights,
+            raw_probs=raw_routing_weights,
+            actual_k=actual_k,
+        )
         self._last_routing = {
             "selected_experts": selected_experts.detach(),
             "routing_weights": routing_weights.detach(),
             "raw_logits": router_logits.detach(),
             "filtered_probs": filtered_weights.detach(),
+            "raw_probs": raw_routing_weights.detach(),
             "actual_k": actual_k,
         }
-        return final_hidden_states, router_logits
+        return final_hidden_states, router_info
 
 
 # Copied from transformers.models.qwen2.modeling_qwen2.Qwen2Attention with Qwen2->TimeMoe

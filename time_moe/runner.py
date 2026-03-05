@@ -11,7 +11,10 @@ import yaml
 from time_moe.datasets.time_moe_dataset import TimeMoEDataset
 from time_moe.datasets.time_moe_window_dataset import TimeMoEWindowDataset
 from time_moe.models.modeling_time_moe import TimeMoeForPrediction, TimeMoeConfig
-from time_moe.trainer.hf_trainer import TimeMoETrainingArguments, TimeMoeTrainer
+from time_moe.trainer.hf_trainer import (
+    TimeMoETrainingArguments, TimeMoeTrainer,
+    PhasedFreezeCallback, GateOnlyFreezeCallback,
+)
 from time_moe.utils.dist_util import get_world_size
 from time_moe.utils.log_util import logger, log_in_local_rank_0
 
@@ -205,10 +208,35 @@ class TimeMoeRunner:
             stride=train_config["stride"],
             normalization_method=train_config["normalization_method"],
         )
+
+        # --- Freeze strategy (plan §10.1) ---
+        freeze_callbacks = []
+        freeze_strategy = getattr(model.config, "freeze_strategy", "none")
+        if freeze_strategy == "phased":
+            freeze_callbacks.append(PhasedFreezeCallback(
+                model=model,
+                config=model.config,
+                phase_a_end=int(train_config.get("phase_a_end", 1000)),
+                phase_b_end=int(train_config.get("phase_b_end", 5000)),
+            ))
+            num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            log_in_local_rank_0(
+                f'Freeze strategy: phased — initial trainable params: {length_to_str(num_trainable)}'
+            )
+        elif freeze_strategy == "gate_only":
+            freeze_callbacks.append(GateOnlyFreezeCallback(model=model))
+            num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            log_in_local_rank_0(
+                f'Freeze strategy: gate_only — trainable params: {length_to_str(num_trainable)}'
+            )
+        else:
+            log_in_local_rank_0('Freeze strategy: none — all params trainable')
+
         trainer = TimeMoeTrainer(
             model=model,
             args=training_args,
             train_dataset=train_ds,
+            callbacks=freeze_callbacks if freeze_callbacks else None,
         )
         trainer.train()
         trainer.save_model(self.output_path)

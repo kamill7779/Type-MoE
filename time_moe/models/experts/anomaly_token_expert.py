@@ -70,5 +70,9 @@ class AnomalyTokenExpert(BaseTokenExpert):
         out = self.out_proj(out)
         return self.output_norm(out)
 
+    def forward_flat_fallback(self, x: torch.Tensor) -> torch.Tensor:
+        out = super().forward_flat_fallback(x)
+        return self.output_norm(out)
+
     def zero_init_output(self):
         nn.init.zeros_(self.out_proj.weight)

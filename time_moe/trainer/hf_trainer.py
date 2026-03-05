@@ -1,15 +1,19 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 _*-
 import math
+import logging
 from dataclasses import field, dataclass
 from functools import partial
+from typing import List, Optional, Set
 
 import inspect
 
 import transformers
 import torch
 from torch.optim.lr_scheduler import LambdaLR
-from transformers import get_scheduler
+from transformers import get_scheduler, TrainerCallback, TrainingArguments, TrainerState, TrainerControl
+
+logger = logging.getLogger(__name__)
 
 
 class TimeMoeTrainer(transformers.Trainer):
@@ -92,3 +96,126 @@ def get_cosine_schedule_with_warmup_min_lr(
         min_lr_ratio=min_lr_ratio,
     )
     return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
+# ---------------------------------------------------------------------------
+# Freeze-strategy callbacks (plan §10.1)
+# ---------------------------------------------------------------------------
+
+def _identify_new_expert_indices(config) -> Set[int]:
+    """Return expert indices marked with ``zero_init_output: true`` in
+    ``custom_expert_specs``, i.e. newly-added (non-pretrained) experts."""
+    specs = getattr(config, "custom_expert_specs", None) or []
+    indices = set()
+    for i, spec in enumerate(specs):
+        if isinstance(spec, dict) and spec.get("zero_init_output", False):
+            indices.add(i)
+    return indices
+
+
+def _param_name_matches(name: str, patterns: List[str]) -> bool:
+    """Return True if ``name`` contains any of the given substring patterns."""
+    for p in patterns:
+        if p in name:
+            return True
+    return False
+
+
+def _set_requires_grad(model: torch.nn.Module, name_patterns: List[str], value: bool):
+    """Set ``requires_grad`` for parameters whose name contains any of the
+    given patterns."""
+    for name, param in model.named_parameters():
+        if _param_name_matches(name, name_patterns):
+            param.requires_grad = value
+
+
+def _freeze_all(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
+
+def _unfreeze_all(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = True
+
+
+class PhasedFreezeCallback(TrainerCallback):
+    """Implements the 3-phase unfreeze protocol from plan §10.1.
+
+    - Phase-A (step 0 → ``phase_a_end``): only gate weights are trainable.
+    - Phase-B (step ``phase_a_end`` → ``phase_b_end``): gate + new experts.
+    - Phase-C (step ``phase_b_end`` +): everything is trainable.
+
+    "New experts" are those whose ``custom_expert_specs`` entry has
+    ``zero_init_output: true``.
+    """
+
+    def __init__(
+            self,
+            model: torch.nn.Module,
+            config,
+            phase_a_end: int = 1000,
+            phase_b_end: int = 5000,
+    ):
+        super().__init__()
+        self.phase_a_end = phase_a_end
+        self.phase_b_end = phase_b_end
+        self._current_phase: Optional[str] = None
+
+        # Build name-match patterns for each group
+        new_expert_indices = _identify_new_expert_indices(config)
+        self._gate_patterns = [".gate."]  # matches ffn_layer.gate.weight etc.
+        self._new_expert_patterns = [f".experts.{i}." for i in new_expert_indices]
+
+        # Apply Phase-A immediately
+        self._apply_phase_a(model)
+
+    def _apply_phase_a(self, model: torch.nn.Module):
+        if self._current_phase == "A":
+            return
+        _freeze_all(model)
+        _set_requires_grad(model, self._gate_patterns, True)
+        self._current_phase = "A"
+        logger.info("PhasedFreezeCallback: entered Phase-A (gate only)")
+
+    def _apply_phase_b(self, model: torch.nn.Module):
+        if self._current_phase == "B":
+            return
+        _freeze_all(model)
+        _set_requires_grad(model, self._gate_patterns + self._new_expert_patterns, True)
+        self._current_phase = "B"
+        logger.info("PhasedFreezeCallback: entered Phase-B (gate + new experts)")
+
+    def _apply_phase_c(self, model: torch.nn.Module):
+        if self._current_phase == "C":
+            return
+        _unfreeze_all(model)
+        self._current_phase = "C"
+        logger.info("PhasedFreezeCallback: entered Phase-C (all params)")
+
+    def on_step_begin(self, args: TrainingArguments, state: TrainerState,
+                      control: TrainerControl, model=None, **kwargs):
+        if model is None:
+            return
+        step = state.global_step
+        if step < self.phase_a_end:
+            self._apply_phase_a(model)
+        elif step < self.phase_b_end:
+            self._apply_phase_b(model)
+        else:
+            self._apply_phase_c(model)
+
+
+class GateOnlyFreezeCallback(TrainerCallback):
+    """Permanently freeze everything except gate weights."""
+
+    def __init__(self, model: torch.nn.Module):
+        super().__init__()
+        _freeze_all(model)
+        _set_requires_grad(model, [".gate."], True)
+        logger.info("GateOnlyFreezeCallback: only gate params are trainable")
+
+    def on_step_begin(self, args: TrainingArguments, state: TrainerState,
+                      control: TrainerControl, model=None, **kwargs):
+        # No state transitions — gate_only is permanent.
+        pass
