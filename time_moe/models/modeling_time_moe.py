@@ -38,11 +38,74 @@ def _get_unpad_data(attention_mask):
     )
 
 
+def typed_preselect(
+        routing_weights: torch.Tensor,
+        expert_type_ids: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """
+    Keep only one winner expert per type for each token.
+    """
+    if expert_type_ids is None:
+        return routing_weights
+    if expert_type_ids.numel() != routing_weights.shape[-1]:
+        raise ValueError(
+            f"expert_type_ids size mismatch: expected {routing_weights.shape[-1]}, got {expert_type_ids.numel()}"
+        )
+
+    filtered = torch.zeros_like(routing_weights)
+    num_types = int(expert_type_ids.max().item()) + 1
+    token_indices = torch.arange(routing_weights.size(0), device=routing_weights.device)
+    for type_id in range(num_types):
+        type_mask = (expert_type_ids == type_id)
+        if not torch.any(type_mask):
+            continue
+        type_probs = routing_weights[:, type_mask]
+        best_local = type_probs.argmax(dim=-1)
+        global_indices = type_mask.nonzero(as_tuple=True)[0]
+        best_global = global_indices[best_local]
+        filtered[token_indices, best_global] = routing_weights[token_indices, best_global]
+    return filtered
+
+
+def _resolve_actual_k(filtered_weights: torch.Tensor, requested_top_k: int) -> int:
+    valid_counts = (filtered_weights > 0).sum(dim=-1)
+    if valid_counts.numel() == 0:
+        return 1
+    min_valid = int(valid_counts.min().item())
+    if min_valid <= 0:
+        return 1
+    return max(1, min(int(requested_top_k), min_valid))
+
+
+def _collect_routing_stats(
+        filtered_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+        num_experts: int,
+        token_mask: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts).float()
+    if token_mask is None:
+        tokens_per_expert = expert_mask.sum(dim=(0, 1)) / float(expert_mask.shape[0] * expert_mask.shape[1])
+        router_prob_per_expert = torch.mean(filtered_weights, dim=0)
+        return tokens_per_expert, router_prob_per_expert
+
+    token_mask = token_mask.to(filtered_weights.device).float()
+    expanded_mask = token_mask[:, None, None]
+    denom_assign = (expanded_mask.sum() * selected_experts.shape[1]).clamp(min=1.0)
+    tokens_per_expert = (expert_mask * expanded_mask).sum(dim=(0, 1)) / denom_assign
+
+    denom_prob = token_mask.sum().clamp(min=1.0)
+    router_prob_per_expert = (filtered_weights * token_mask[:, None]).sum(dim=0) / denom_prob
+    return tokens_per_expert, router_prob_per_expert
+
+
 def load_balancing_loss_func(
         gate_logits: Union[torch.Tensor, Tuple[torch.Tensor], List[torch.Tensor]],
         top_k: int,
         num_experts: int = None,
-        attention_mask: Optional[torch.Tensor] = None
+        attention_mask: Optional[torch.Tensor] = None,
+        router_mode: str = "standard",
+        expert_type_map: Optional[List[int]] = None,
 ) -> torch.Tensor:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
@@ -67,56 +130,93 @@ def load_balancing_loss_func(
         The auxiliary loss.
     """
     if gate_logits is None or not isinstance(gate_logits, (tuple, list)) or gate_logits[0] is None:
-        return 0.0
+        return torch.tensor(0.0)
 
     compute_device = gate_logits[0].device
-    concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+    if num_experts is None:
+        num_experts = gate_logits[0].shape[-1]
 
-    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
-
-    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-
-    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
-
-    if attention_mask is None:
-        # Compute the percentage of tokens routed to each expert
-        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
-
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+    typed_mode = router_mode == "typed_topk" and expert_type_map is not None and len(expert_type_map) == num_experts
+    if typed_mode:
+        expert_type_ids = torch.tensor(expert_type_map, dtype=torch.long, device=compute_device)
     else:
-        batch_size, sequence_length = attention_mask.shape
-        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+        expert_type_ids = None
 
-        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
-        expert_attention_mask = (
-            attention_mask[None, :, :, None, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, 2, num_experts))
-            .reshape(-1, 2, num_experts)
-            .to(compute_device)
+    token_mask = None
+    if attention_mask is not None:
+        token_mask = attention_mask.reshape(-1).to(compute_device).float()
+
+    layer_losses = []
+    for layer_gate in gate_logits:
+        layer_logits = layer_gate.to(compute_device)
+        routing_weights = torch.nn.functional.softmax(layer_logits, dim=-1)
+        filtered_weights = typed_preselect(routing_weights, expert_type_ids) if typed_mode else routing_weights
+
+        layer_k = _resolve_actual_k(filtered_weights, top_k)
+        _, selected_experts = torch.topk(filtered_weights, layer_k, dim=-1)
+
+        layer_mask = token_mask
+        if layer_mask is not None and layer_mask.numel() != filtered_weights.shape[0]:
+            layer_mask = None
+        tokens_per_expert, router_prob_per_expert = _collect_routing_stats(
+            filtered_weights=filtered_weights,
+            selected_experts=selected_experts,
+            num_experts=num_experts,
+            token_mask=layer_mask,
         )
+        layer_loss = torch.sum(tokens_per_expert * router_prob_per_expert)
+        layer_losses.append(layer_loss * num_experts)
 
-        # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
-            expert_attention_mask, dim=0
-        )
+    if len(layer_losses) == 0:
+        return torch.tensor(0.0, device=compute_device)
+    return torch.stack(layer_losses).mean()
 
-        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
-        router_per_expert_attention_mask = (
-            attention_mask[None, :, :, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
-            .reshape(-1, num_experts)
-            .to(compute_device)
-        )
 
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
-            router_per_expert_attention_mask, dim=0
-        )
+def type_diversity_loss_func(
+        gate_logits: Union[torch.Tensor, Tuple[torch.Tensor], List[torch.Tensor]],
+        top_k: int,
+        expert_type_map: Optional[List[int]],
+        attention_mask: Optional[torch.Tensor] = None,
+        router_mode: str = "standard",
+) -> torch.Tensor:
+    if gate_logits is None or not isinstance(gate_logits, (tuple, list)) or gate_logits[0] is None:
+        return torch.tensor(0.0)
+    if top_k <= 1 or router_mode != "typed_topk":
+        return torch.tensor(0.0, device=gate_logits[0].device)
 
-    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(dim=0))
+    num_experts = gate_logits[0].shape[-1]
+    if expert_type_map is None or len(expert_type_map) != num_experts:
+        return torch.tensor(0.0, device=gate_logits[0].device)
 
-    return overall_loss * num_experts
+    compute_device = gate_logits[0].device
+    expert_type_ids = torch.tensor(expert_type_map, dtype=torch.long, device=compute_device)
+    num_types = int(expert_type_ids.max().item()) + 1
+
+    token_mask = None
+    if attention_mask is not None:
+        token_mask = attention_mask.reshape(-1).to(compute_device).bool()
+
+    losses = []
+    for layer_gate in gate_logits:
+        routing_weights = torch.nn.functional.softmax(layer_gate.to(compute_device), dim=-1)
+        filtered_weights = typed_preselect(routing_weights, expert_type_ids)
+        layer_k = _resolve_actual_k(filtered_weights, top_k)
+        _, selected_experts = torch.topk(filtered_weights, layer_k, dim=-1)
+
+        if token_mask is not None and token_mask.numel() == selected_experts.shape[0]:
+            selected_experts = selected_experts[token_mask]
+        if selected_experts.numel() == 0:
+            continue
+
+        selected_types = expert_type_ids[selected_experts]
+        type_one_hot = F.one_hot(selected_types, num_classes=num_types).float()
+        unique_per_token = (type_one_hot.sum(dim=1) > 0).sum(dim=-1).float()
+        target_unique = float(min(layer_k, num_types))
+        losses.append((target_unique - unique_per_token).clamp(min=0).mean())
+
+    if len(losses) == 0:
+        return torch.tensor(0.0, device=compute_device)
+    return torch.stack(losses).mean()
 
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
@@ -269,7 +369,10 @@ class TimeMoeSparseExpertsLayer(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
-        self.norm_topk_prob = False
+        self.norm_topk_prob = bool(getattr(config, "norm_topk_prob", False))
+        self.router_mode = getattr(config, "router_mode", "standard")
+        self.jitter_noise = float(getattr(config, "jitter_noise", 0.0))
+        self.actual_k = self.top_k
 
         moe_intermediate_size = self.config.intermediate_size // self.top_k
 
@@ -290,17 +393,35 @@ class TimeMoeSparseExpertsLayer(nn.Module):
         )
         self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
+        expert_type_map = getattr(config, "expert_type_map", [])
+        if isinstance(expert_type_map, list) and len(expert_type_map) == self.num_experts:
+            self.register_buffer("expert_type_ids", torch.tensor(expert_type_map, dtype=torch.long), persistent=False)
+        else:
+            self.register_buffer("expert_type_ids", None, persistent=False)
+        self._last_routing = {}
+
     def forward(self, hidden_states: torch.Tensor):
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+        hidden_states_3d = hidden_states
+        hidden_states = hidden_states_3d.view(-1, hidden_dim)
         # router_logits -> (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
+        if self.training and self.jitter_noise > 0:
+            router_logits = router_logits + torch.randn_like(router_logits) * self.jitter_noise
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        if self.router_mode == "typed_topk":
+            filtered_weights = typed_preselect(routing_weights, self.expert_type_ids)
+        else:
+            filtered_weights = routing_weights
+
+        actual_k = _resolve_actual_k(filtered_weights, self.top_k)
+        self.actual_k = actual_k
+
+        routing_weights, selected_experts = torch.topk(filtered_weights, actual_k, dim=-1)
         if self.norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True).clamp(min=1e-9)
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
@@ -311,17 +432,28 @@ class TimeMoeSparseExpertsLayer(nn.Module):
         # One hot encode the selected experts to create an expert mask
         # this will be used to easily index which expert is going to be sollicitated
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
+        seq_expert_cache = {}
 
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
             idx, top_x = torch.where(expert_mask[expert_idx])
+            if top_x.numel() == 0:
+                continue
 
             # Index the correct hidden states and compute the expert hidden state for
             # the current expert. We need to make sure to multiply the output hidden
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
+            interface_kind = getattr(expert_layer, "interface_kind", "flat")
+            if interface_kind == "seq":
+                if expert_idx not in seq_expert_cache:
+                    seq_out = expert_layer(hidden_states_3d)
+                    seq_expert_cache[expert_idx] = seq_out.reshape(-1, hidden_dim)
+                current_state = seq_expert_cache[expert_idx][top_x]
+                current_hidden_states = current_state * routing_weights[top_x, idx, None]
+            else:
+                current_state = hidden_states[None, top_x].reshape(-1, hidden_dim)
+                current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
 
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `top_x` tensor here.
@@ -333,6 +465,13 @@ class TimeMoeSparseExpertsLayer(nn.Module):
         final_hidden_states = final_hidden_states + shared_expert_output
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        self._last_routing = {
+            "selected_experts": selected_experts.detach(),
+            "routing_weights": routing_weights.detach(),
+            "raw_logits": router_logits.detach(),
+            "filtered_probs": filtered_weights.detach(),
+            "actual_k": actual_k,
+        }
         return final_hidden_states, router_logits
 
 
@@ -1029,9 +1168,21 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
                     router_logits,
                     top_k=self.num_experts_per_tok,
                     num_experts=self.config.num_experts,
-                    attention_mask=attention_mask
+                    attention_mask=attention_mask,
+                    router_mode=getattr(self.config, "router_mode", "standard"),
+                    expert_type_map=getattr(self.config, "expert_type_map", None),
                 )
-                loss += self.router_aux_loss_factor * temporal_aux_loss.to(loss.device)
+                diversity_loss = type_diversity_loss_func(
+                    router_logits,
+                    top_k=self.num_experts_per_tok,
+                    expert_type_map=getattr(self.config, "expert_type_map", None),
+                    attention_mask=attention_mask,
+                    router_mode=getattr(self.config, "router_mode", "standard"),
+                )
+                aux_loss = temporal_aux_loss.to(loss.device) + (
+                    float(getattr(self.config, "type_diversity_factor", 0.0)) * diversity_loss.to(loss.device)
+                )
+                loss += self.router_aux_loss_factor * aux_loss
         else:
             if max_horizon_length is None:
                 horizon_length = self.config.horizon_lengths[0]
