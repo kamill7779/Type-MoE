@@ -163,3 +163,25 @@ cython_debug/
 
 # local third-party source mirrors (for expert adaptation study)
 thirdparty/
+
+# ── Large model weights & generated artifacts ──────────────────
+# Pre-trained base model (>200 MB safetensors)
+TimeMoE-50M/
+
+# Generated training data (converted from CSV)
+data_prepared/
+
+# Training outputs: checkpoints, tensorboard logs, routing/eval JSON
+# (JSON summary files are referenced in docs but not tracked here)
+logs/
+
+# Model weight files anywhere in the tree
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Root-level temporary eval output files
+eval_results.json
+eval_full_output.txt
+quick_eval_output.txt

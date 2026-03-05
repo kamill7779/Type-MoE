@@ -166,8 +166,8 @@ def evaluate(args):
             device = f"cuda:{local_rank}"
             is_dist = True
         except Exception as e:
-            print('Error: ', f'Setup nccl fail, so set device to cpu: {e}')
-            device = 'cpu'
+            print(f'Info: NCCL distributed init failed ({e}), using single-GPU mode.')
+            device = f"cuda:{local_rank}"
             is_dist = False
     else:
         device = 'cpu'
