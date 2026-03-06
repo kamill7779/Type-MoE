@@ -165,6 +165,9 @@ cython_debug/
 thirdparty/
 
 # ── Large model weights & generated artifacts ──────────────────
+# Raw benchmark datasets (CSV, copied from Autoformer/dataset/)
+data/
+
 # Pre-trained base model (>200 MB safetensors)
 TimeMoE-50M/
 

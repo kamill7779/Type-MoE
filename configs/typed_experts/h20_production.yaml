@@ -1,0 +1,74 @@
+# ─────────────────────────────────────────────────────────
+# Type-MoE H20-96G 生产训练配置
+# 目标: 5000 步完整训练，max_length=512，多数据集
+# GPU: NVIDIA H20 (96 GB HBM3)
+# 预计用时: ~3-4 小时 (训练部分)
+# ─────────────────────────────────────────────────────────
+router_mode: typed_topk
+num_experts_per_tok: 2
+norm_topk_prob: false
+jitter_noise: 0.02
+type_diversity_factor: 0.01
+router_aux_loss_factor: 0.02
+freeze_strategy: phased
+
+expert_types:
+  - trend
+  - cycle
+  - anomaly
+
+# trend x3, cycle x3, anomaly x2
+expert_type_map: [0, 0, 0, 1, 1, 1, 2, 2]
+
+custom_expert_specs:
+  # ── Trend experts (0-2) ──
+  - name: mlp_temporal_block
+    type: trend
+    interface: flat
+
+  - name: nbeats_trend
+    type: trend
+    interface: flat
+    zero_init_output: true
+    params:
+      num_layers: 4
+      theta_dim: 16
+
+  - name: autoformer_trend
+    type: trend
+    interface: seq
+    zero_init_output: true
+    params:
+      kernel_size: 25
+
+  # ── Cycle experts (3-5) ──
+  - name: mlp_temporal_block
+    type: cycle
+    interface: flat
+
+  - name: autoformer_cycle
+    type: cycle
+    interface: seq
+    zero_init_output: true
+    params:
+      kernel_size: 25
+      top_k_freq: 3
+
+  - name: fedformer_cycle
+    type: cycle
+    interface: seq
+    zero_init_output: true
+    params:
+      modes: 32
+
+  # ── Anomaly experts (6-7) ──
+  - name: mlp_temporal_block
+    type: anomaly
+    interface: flat
+
+  - name: anomaly_attn
+    type: anomaly
+    interface: seq
+    zero_init_output: true
+    params:
+      num_heads: 8
