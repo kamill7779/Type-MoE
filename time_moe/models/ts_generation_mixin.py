@@ -94,6 +94,14 @@ class TSGenerationMixin(GenerationMixin):
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         model_kwargs["cache_position"] = torch.arange(cur_len, device=input_ids.device)
 
+        # Reset seq expert context buffers for fresh generation
+        _model = getattr(self, 'model', None)
+        if _model is not None:
+            for layer in getattr(_model, 'layers', []):
+                moe = getattr(layer, 'block_sparse_moe', None)
+                if moe is not None and hasattr(moe, 'reset_seq_context'):
+                    moe.reset_seq_context()
+
         max_length = stopping_criteria.max_length
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs

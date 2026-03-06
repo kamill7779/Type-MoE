@@ -35,6 +35,7 @@ class TimeMoeConfig(PretrainedConfig):
             type_diversity_factor: float = 0.0,
             seq_expert_mode: str = "full_seq",
             seq_expert_window: int = 64,
+            seq_expert_context_len: int = 512,
             expert_output_norm: bool = True,
             custom_expert_specs: List[dict] = None,
             freeze_strategy: str = "none",
@@ -74,6 +75,7 @@ class TimeMoeConfig(PretrainedConfig):
         self.type_diversity_factor = type_diversity_factor
         self.seq_expert_mode = seq_expert_mode
         self.seq_expert_window = seq_expert_window
+        self.seq_expert_context_len = seq_expert_context_len
         self.expert_output_norm = expert_output_norm
         self.custom_expert_specs = custom_expert_specs if custom_expert_specs is not None else []
         self.freeze_strategy = freeze_strategy

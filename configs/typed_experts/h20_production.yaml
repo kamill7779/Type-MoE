@@ -10,6 +10,7 @@ norm_topk_prob: false
 jitter_noise: 0.02
 type_diversity_factor: 0.01
 router_aux_loss_factor: 0.02
+seq_expert_context_len: 512
 freeze_strategy: phased
 
 expert_types:

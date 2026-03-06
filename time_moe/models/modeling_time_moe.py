@@ -263,11 +263,42 @@ class TimeMoeSparseExpertsLayer(nn.Module):
             self.register_buffer("expert_type_ids", None, persistent=False)
         self._last_routing = {}
 
+        # SeqContextBuffer: rolling hidden_states for seq experts during inference.
+        # Allows FFT / MA / attention to always see a sufficient context window.
+        self._seq_ctx_buffer: Optional[torch.Tensor] = None
+        self._seq_ctx_max_len = int(getattr(config, 'seq_expert_context_len', 512))
+
+    def reset_seq_context(self):
+        """Clear the seq expert context buffer.  Call before each generate() run."""
+        self._seq_ctx_buffer = None
+
     def forward(self, hidden_states: torch.Tensor):
         """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_3d = hidden_states
         hidden_states = hidden_states_3d.view(-1, hidden_dim)
+
+        # ---- SeqContextBuffer: build rolling context for seq experts ----
+        if not self.training:
+            # Reset buffer on batch-size change (safety guard)
+            if self._seq_ctx_buffer is not None and self._seq_ctx_buffer.shape[0] != batch_size:
+                self._seq_ctx_buffer = None
+            # Append current hidden_states to buffer
+            if self._seq_ctx_buffer is None:
+                self._seq_ctx_buffer = hidden_states_3d.detach()
+            else:
+                self._seq_ctx_buffer = torch.cat(
+                    [self._seq_ctx_buffer, hidden_states_3d.detach()], dim=1
+                )
+            # Truncate to max context length
+            if self._seq_ctx_buffer.shape[1] > self._seq_ctx_max_len:
+                self._seq_ctx_buffer = self._seq_ctx_buffer[:, -self._seq_ctx_max_len:]
+            seq_input_3d = self._seq_ctx_buffer  # [B, buffer_len, H]
+            _use_seq_fallback = (seq_input_3d.shape[1] <= 1)
+        else:
+            # Training: no buffer, use current hidden_states directly
+            seq_input_3d = hidden_states_3d
+            _use_seq_fallback = (sequence_length == 1)
         # router_logits -> (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
         if self.training and self.jitter_noise > 0:
@@ -297,10 +328,6 @@ class TimeMoeSparseExpertsLayer(nn.Module):
         expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
         seq_expert_cache = {}
 
-        # KV-cache inference: when sequence_length == 1, seq experts cannot run
-        # FFT / moving-average meaningfully.  Fall back to flat interface.
-        _use_seq_fallback = (sequence_length == 1)
-
         # Loop over all available experts in the model and perform the computation on each expert
         for expert_idx in range(self.num_experts):
             expert_layer = self.experts[expert_idx]
@@ -313,10 +340,11 @@ class TimeMoeSparseExpertsLayer(nn.Module):
             # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
             interface_kind = getattr(expert_layer, "interface_kind", "flat")
             if interface_kind == "seq" and not _use_seq_fallback:
-                # S1: full-sequence execution + selective aggregation
+                # S1: run seq expert on full context buffer, cache only tail (current chunk)
                 if expert_idx not in seq_expert_cache:
-                    seq_out = expert_layer(hidden_states_3d)
-                    seq_expert_cache[expert_idx] = seq_out.reshape(-1, hidden_dim)
+                    seq_out = expert_layer(seq_input_3d)  # [B, buffer_len, H]
+                    # Only keep the last *sequence_length* tokens for index alignment
+                    seq_expert_cache[expert_idx] = seq_out[:, -sequence_length:, :].reshape(-1, hidden_dim)
                 current_state = seq_expert_cache[expert_idx][top_x]
                 current_hidden_states = current_state * routing_weights[top_x, idx, None]
             elif interface_kind == "seq" and _use_seq_fallback:

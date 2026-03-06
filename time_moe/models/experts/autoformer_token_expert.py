@@ -66,7 +66,7 @@ class AutoformerTrendExpert(BaseTokenExpert):
             output_norm: bool = True,
             kernel_size: int = 25,
     ):
-        super().__init__()
+        super().__init__(hidden_size=hidden_size)
         self.decomp = SeriesDecomposition(kernel_size=kernel_size)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.output_norm = ExpertRMSNorm(hidden_size) if output_norm else nn.Identity()
@@ -98,7 +98,7 @@ class AutoformerCycleExpert(BaseTokenExpert):
             kernel_size: int = 25,
             top_k_freq: int = 3,
     ):
-        super().__init__()
+        super().__init__(hidden_size=hidden_size)
         self.decomp = SeriesDecomposition(kernel_size=kernel_size)
         self.auto_corr = SimplifiedAutoCorrelation(top_k_freq=top_k_freq)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)

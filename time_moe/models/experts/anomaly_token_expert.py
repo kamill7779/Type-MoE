@@ -23,7 +23,7 @@ class AnomalyTokenExpert(BaseTokenExpert):
             num_heads: int = 8,
             causal: bool = True,
     ):
-        super().__init__()
+        super().__init__(hidden_size=hidden_size)
         if hidden_size % num_heads != 0:
             raise ValueError(f"hidden_size={hidden_size} must be divisible by num_heads={num_heads}")
         self.hidden_size = hidden_size

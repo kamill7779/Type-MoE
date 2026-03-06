@@ -19,7 +19,7 @@ class FedFormerCycleExpert(BaseTokenExpert):
             output_norm: bool = True,
             modes: int = 32,
     ):
-        super().__init__()
+        super().__init__(hidden_size=hidden_size)
         self.modes = max(1, int(modes))
         self.freq_weight = nn.Parameter(torch.randn(self.modes, hidden_size) * 0.02)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
