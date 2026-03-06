@@ -43,9 +43,9 @@ OUTPUT_DIR = os.path.join(BASE_DIR, "logs", "typemoe_minimal_test")
 
 # ── 训练超参 (最小测试) ──
 TRAIN_STEPS = 100           # 仅 100 步: 验证流程通畅
-MAX_LENGTH = 128            # 较短窗口，节省显存
-MICRO_BATCH = 2             # RTX 5060 显存有限
-GLOBAL_BATCH = 4            # 小 batch
+MAX_LENGTH = 512            # 与评估上下文对齐，消除训练-推理分布偏移
+MICRO_BATCH = 1             # RTX 5060: 512 长序列降到 1 防 OOM（梯度累积补偿）
+GLOBAL_BATCH = 4            # 小 batch（等效 gradient accumulation ×4）
 PRECISION = "bf16"          # bfloat16
 LEARNING_RATE = 5e-4        # 略大 lr，100 步需要更快的收敛信号
 MIN_LEARNING_RATE = 1e-5
