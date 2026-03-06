@@ -37,21 +37,22 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "TimeMoE-50M")
 CONFIG_OVERRIDE = os.path.join(BASE_DIR, "configs", "typed_experts", "minimal_test.yaml")
 CSV_PATH = os.path.join(BASE_DIR, "data", "ETT-small", "ETTh1.csv")
+ELEC_CSV_PATH = os.path.join(BASE_DIR, "data", "electricity.csv")  # 321 列，取 8 列均匀采样
 TRAIN_DATA_DIR = os.path.join(BASE_DIR, "data_prepared")
-TRAIN_DATA_PATH = os.path.join(TRAIN_DATA_DIR, "etth1_train.json")
-OUTPUT_DIR = os.path.join(BASE_DIR, "logs", "typemoe_minimal_test")
+TRAIN_DATA_PATH = os.path.join(TRAIN_DATA_DIR, "etth1_elec_train.json")
+OUTPUT_DIR = os.path.join(BASE_DIR, "logs", "typemoe_multisrc_test")
 
 # ── 训练超参 (最小测试) ──
-TRAIN_STEPS = 100           # 仅 100 步: 验证流程通畅
+TRAIN_STEPS = 300           # 多数据集训练，适当增加步数
 MAX_LENGTH = 512            # 与评估上下文对齐，消除训练-推理分布偏移
 MICRO_BATCH = 1             # RTX 5060: 512 长序列降到 1 防 OOM（梯度累积补偿）
 GLOBAL_BATCH = 4            # 小 batch（等效 gradient accumulation ×4）
 PRECISION = "bf16"          # bfloat16
 LEARNING_RATE = 5e-4        # 略大 lr，100 步需要更快的收敛信号
 MIN_LEARNING_RATE = 1e-5
-PHASE_A_END = 20            # Phase-A: 仅 gate 可训 (步骤 0-19)
-PHASE_B_END = 50            # Phase-B: gate + 新专家 (步骤 20-49)
-                            # Phase-C: 全参数 (步骤 50+)
+PHASE_A_END = 60            # Phase-A: 仅 gate 可训 (步骤 0-59)
+PHASE_B_END = 150           # Phase-B: gate + 新专家 (步骤 60-149)
+                            # Phase-C: 全参数 (步骤 150+)
 
 # ── 评估参数 ──
 EVAL_PRED_LEN = 96
@@ -63,28 +64,43 @@ EVAL_BATCH_SIZE = 16
 #  Step 1 : 数据准备 – ETTh1.csv → JSON (多序列)
 # =====================================================================
 def prepare_training_data():
-    """把 ETTh1.csv 的 7 个特征列转换为 JSON 训练数据
-    每列作为一条独立的时间序列，取前 60% 作为训练集"""
+    """训练数据准备：ETTh1（7列）+ Electricity（8列均匀采样）
+    每列作为一条独立的时间序列，各取前 60% 作为训练集"""
     if os.path.exists(TRAIN_DATA_PATH):
         log.info(f"训练数据已存在: {TRAIN_DATA_PATH}，跳过准备步骤")
         return
 
-    log.info(f"读取 CSV: {CSV_PATH}")
+    sequences = []
+
+    # ── 数据源 1：ETTh1（7 特征列）──
+    log.info(f"读取 ETTh1: {CSV_PATH}")
     df = pd.read_csv(CSV_PATH)
     cols = [c for c in df.columns if c != "date"]
     n = len(df)
-    train_end = int(n * 0.6)  # ~10452 points
-    log.info(f"总行数={n}, 使用前 {train_end} 行 (60%) 的 {len(cols)} 列作为训练序列")
-
-    sequences = []
+    train_end = int(n * 0.6)
+    log.info(f"  ETTh1: 总行数={n}, 取前 {train_end} 行, {len(cols)} 列")
     for col in cols:
-        seq = df[col].values[:train_end].astype(float).tolist()
-        sequences.append(seq)
+        sequences.append(df[col].values[:train_end].astype(float).tolist())
 
+    # ── 数据源 2：Electricity（321列 → 均匀取 8 列）──
+    log.info(f"读取 Electricity: {ELEC_CSV_PATH}")
+    df_elec = pd.read_csv(ELEC_CSV_PATH)
+    elec_cols = [c for c in df_elec.columns if c != "date"]
+    # 从 321 列中均匀采样 8 列，覆盖高/低用电量区间
+    n_sample = 8
+    step = max(1, len(elec_cols) // n_sample)
+    sampled_cols = elec_cols[::step][:n_sample]
+    n_elec = len(df_elec)
+    elec_end = int(n_elec * 0.6)
+    log.info(f"  Electricity: 总行数={n_elec}, 取前 {elec_end} 行, 均匀采样 {len(sampled_cols)}/{len(elec_cols)} 列")
+    for col in sampled_cols:
+        sequences.append(df_elec[col].values[:elec_end].astype(float).tolist())
+
+    log.info(f"合并后共 {len(sequences)} 条训练序列")
     os.makedirs(TRAIN_DATA_DIR, exist_ok=True)
     with open(TRAIN_DATA_PATH, "w") as f:
         json.dump(sequences, f)
-    log.info(f"训练数据已保存: {TRAIN_DATA_PATH} ({len(sequences)} 条序列, 每条 {train_end} 点)")
+    log.info(f"训练数据已保存: {TRAIN_DATA_PATH}")
 
 
 # =====================================================================
