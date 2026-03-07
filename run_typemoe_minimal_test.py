@@ -36,23 +36,27 @@ log = logging.getLogger("TypeMoE-Test")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "TimeMoE-50M")
 CONFIG_OVERRIDE = os.path.join(BASE_DIR, "configs", "typed_experts", "minimal_test.yaml")
-CSV_PATH = os.path.join(BASE_DIR, "data", "ETT-small", "ETTh1.csv")
+CSV_PATH      = os.path.join(BASE_DIR, "data", "ETT-small", "ETTh1.csv")
+ETTH2_PATH    = os.path.join(BASE_DIR, "data", "ETT-small", "ETTh2.csv")
+ETTM1_PATH    = os.path.join(BASE_DIR, "data", "ETT-small", "ETTm1.csv")
+ETTM2_PATH    = os.path.join(BASE_DIR, "data", "ETT-small", "ETTm2.csv")
+WEATHER_PATH  = os.path.join(BASE_DIR, "data", "weather.csv")
 ELEC_CSV_PATH = os.path.join(BASE_DIR, "data", "electricity.csv")  # 321 列，取 8 列均匀采样
-TRAIN_DATA_DIR = os.path.join(BASE_DIR, "data_prepared")
-TRAIN_DATA_PATH = os.path.join(TRAIN_DATA_DIR, "etth1_elec_train.json")
-OUTPUT_DIR = os.path.join(BASE_DIR, "logs", "typemoe_multisrc_test")
+TRAIN_DATA_DIR  = os.path.join(BASE_DIR, "data_prepared")
+TRAIN_DATA_PATH = os.path.join(TRAIN_DATA_DIR, "multisrc_full_train.json")
+OUTPUT_DIR      = os.path.join(BASE_DIR, "logs", "typemoe_2000step_multisrc")
 
 # ── 训练超参 (最小测试) ──
-TRAIN_STEPS = 300           # 多数据集训练，适当增加步数
+TRAIN_STEPS = 2000          # 多数据集完整训练
 MAX_LENGTH = 512            # 与评估上下文对齐，消除训练-推理分布偏移
 MICRO_BATCH = 1             # RTX 5060: 512 长序列降到 1 防 OOM（梯度累积补偿）
 GLOBAL_BATCH = 4            # 小 batch（等效 gradient accumulation ×4）
 PRECISION = "bf16"          # bfloat16
-LEARNING_RATE = 5e-4        # 略大 lr，100 步需要更快的收敛信号
+LEARNING_RATE = 3e-4        # 2000 步可略降 lr
 MIN_LEARNING_RATE = 1e-5
-PHASE_A_END = 60            # Phase-A: 仅 gate 可训 (步骤 0-59)
-PHASE_B_END = 150           # Phase-B: gate + 新专家 (步骤 60-149)
-                            # Phase-C: 全参数 (步骤 150+)
+PHASE_A_END = 400           # Phase-A: 仅 gate 可训
+PHASE_B_END = 1000          # Phase-B: gate + 新专家
+                            # Phase-C: 全参数 (步骤 1000+)
 
 # ── 评估参数 ──
 EVAL_PRED_LEN = 96
@@ -64,37 +68,38 @@ EVAL_BATCH_SIZE = 16
 #  Step 1 : 数据准备 – ETTh1.csv → JSON (多序列)
 # =====================================================================
 def prepare_training_data():
-    """训练数据准备：ETTh1（7列）+ Electricity（8列均匀采样）
-    每列作为一条独立的时间序列，各取前 60% 作为训练集"""
+    """训练数据准备：
+    - ETTh1/h2 (7列各) 、15787点/列
+    - ETTm1/m2 (7列各) 、41808点/列
+    - Weather (21列) 、31618点/列
+    - Electricity (321列 → 8列均匀采样) 、15782点/列
+    共 57 条训练序列
+    """
     if os.path.exists(TRAIN_DATA_PATH):
         log.info(f"训练数据已存在: {TRAIN_DATA_PATH}，跳过准备步骤")
         return
 
     sequences = []
 
-    # ── 数据源 1：ETTh1（7 特征列）──
-    log.info(f"读取 ETTh1: {CSV_PATH}")
-    df = pd.read_csv(CSV_PATH)
-    cols = [c for c in df.columns if c != "date"]
-    n = len(df)
-    train_end = int(n * 0.6)
-    log.info(f"  ETTh1: 总行数={n}, 取前 {train_end} 行, {len(cols)} 列")
-    for col in cols:
-        sequences.append(df[col].values[:train_end].astype(float).tolist())
+    def add_csv(path, label, col_sample=None):
+        df = pd.read_csv(path)
+        cols = [c for c in df.columns if c != "date"]
+        if col_sample is not None:
+            step = max(1, len(cols) // col_sample)
+            cols = cols[::step][:col_sample]
+        n = len(df)
+        end = int(n * 0.6)
+        log.info(f"  {label}: {n}行×{len(cols)}列 → 取前 {end} 行 ({len(cols)} 条序列)")
+        for col in cols:
+            sequences.append(df[col].values[:end].astype(float).tolist())
 
-    # ── 数据源 2：Electricity（321列 → 均匀取 8 列）──
-    log.info(f"读取 Electricity: {ELEC_CSV_PATH}")
-    df_elec = pd.read_csv(ELEC_CSV_PATH)
-    elec_cols = [c for c in df_elec.columns if c != "date"]
-    # 从 321 列中均匀采样 8 列，覆盖高/低用电量区间
-    n_sample = 8
-    step = max(1, len(elec_cols) // n_sample)
-    sampled_cols = elec_cols[::step][:n_sample]
-    n_elec = len(df_elec)
-    elec_end = int(n_elec * 0.6)
-    log.info(f"  Electricity: 总行数={n_elec}, 取前 {elec_end} 行, 均匀采样 {len(sampled_cols)}/{len(elec_cols)} 列")
-    for col in sampled_cols:
-        sequences.append(df_elec[col].values[:elec_end].astype(float).tolist())
+    log.info("=== 准备多数据集训练数据 ===")
+    add_csv(CSV_PATH,     "ETTh1",       col_sample=None)   # 7 列
+    add_csv(ETTH2_PATH,   "ETTh2",       col_sample=None)   # 7 列
+    add_csv(ETTM1_PATH,   "ETTm1",       col_sample=None)   # 7 列
+    add_csv(ETTM2_PATH,   "ETTm2",       col_sample=None)   # 7 列
+    add_csv(WEATHER_PATH, "Weather",     col_sample=None)   # 21 列
+    add_csv(ELEC_CSV_PATH,"Electricity", col_sample=8)      # 321列→均匀取8列
 
     log.info(f"合并后共 {len(sequences)} 条训练序列")
     os.makedirs(TRAIN_DATA_DIR, exist_ok=True)
